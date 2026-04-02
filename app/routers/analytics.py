@@ -1,47 +1,105 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
+from datetime import datetime, timedelta
 from typing import Optional, List
-from datetime import datetime
-from app import schemas, analytics, auth
-from app.database import get_db
+from app import models, schemas
 
-router = APIRouter(prefix="/analytics", tags=["analytics"])
-
-@router.get("/summary", response_model=schemas.SummaryResponse)
 def get_summary(
+    db: Session, 
+    user_id: int,
     start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
-    db: Session = Depends(get_db),
-    current_user = Depends(auth.get_current_user)
+    end_date: Optional[datetime] = None
 ):
-    """Get financial summary (All authenticated users)"""
-    return analytics.get_summary(
-        db, current_user.id, start_date, end_date
+    query = db.query(models.Transaction).filter(models.Transaction.user_id == user_id)
+    
+    if start_date:
+        query = query.filter(models.Transaction.date >= start_date)
+    if end_date:
+        query = query.filter(models.Transaction.date <= end_date)
+    
+    transactions = query.all()
+    
+    total_income = sum(t.amount for t in transactions if t.type == "income")
+    total_expenses = sum(t.amount for t in transactions if t.type == "expense")
+    
+    return schemas.SummaryResponse(
+        total_income=total_income,
+        total_expenses=total_expenses,
+        balance=total_income - total_expenses,
+        total_transactions=len(transactions),
+        period_start=start_date,
+        period_end=end_date
     )
 
-@router.get("/category-breakdown/{type}", response_model=List[schemas.CategoryBreakdown])
 def get_category_breakdown(
+    db: Session, 
+    user_id: int,
     type: str,
     start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
-    db: Session = Depends(get_db),
-    current_user = Depends(auth.get_current_user)
+    end_date: Optional[datetime] = None
 ):
-    """Get category breakdown for income or expenses (All authenticated users)"""
-    if type not in ["income", "expense"]:
-        raise HTTPException(status_code=400, detail="Type must be 'income' or 'expense'")
-    
-    return analytics.get_category_breakdown(
-        db, current_user.id, type, start_date, end_date
+    query = db.query(
+        models.Transaction.category,
+        func.sum(models.Transaction.amount).label('total')
+    ).filter(
+        models.Transaction.user_id == user_id,
+        models.Transaction.type == type
     )
-
-@router.get("/monthly", response_model=List[schemas.MonthlySummary])
-def get_monthly_summary(
-    months: int = Query(6, ge=1, le=24),
-    db: Session = Depends(get_db),
-    current_user = Depends(auth.get_current_user)
-):
-    """Get monthly summary for last N months (All authenticated users)"""
-    return analytics.get_monthly_summary(db, current_user.id, months)
-
     
+    if start_date:
+        query = query.filter(models.Transaction.date >= start_date)
+    if end_date:
+        query = query.filter(models.Transaction.date <= end_date)
+    
+    results = query.group_by(models.Transaction.category).all()
+    
+    total = sum(r.total for r in results)
+    
+    return [
+        schemas.CategoryBreakdown(
+            category=r.category,
+            total=r.total,
+            percentage=(r.total / total * 100) if total > 0 else 0
+        )
+        for r in results
+    ]
+
+def get_monthly_summary(
+    db: Session, 
+    user_id: int,
+    months: int = 6
+):
+    # Get transactions from last N months
+    start_date = datetime.utcnow() - timedelta(days=months * 30)
+    
+    transactions = db.query(models.Transaction).filter(
+        models.Transaction.user_id == user_id,
+        models.Transaction.date >= start_date
+    ).all()
+    
+    monthly_data = {}
+    
+    for transaction in transactions:
+        month_key = transaction.date.strftime("%Y-%m")
+        
+        if month_key not in monthly_data:
+            monthly_data[month_key] = {"income": 0, "expenses": 0}
+        
+        if transaction.type == "income":
+            monthly_data[month_key]["income"] += transaction.amount
+        else:
+            monthly_data[month_key]["expenses"] += transaction.amount
+    
+    # Sort by month
+    sorted_months = sorted(monthly_data.keys())
+    
+    return [
+        schemas.MonthlySummary(
+            month=month,
+            income=data["income"],
+            expenses=data["expenses"],
+            balance=data["income"] - data["expenses"]
+        )
+        for month, data in monthly_data.items()
+    ][-months:]  # Return last N months
+
